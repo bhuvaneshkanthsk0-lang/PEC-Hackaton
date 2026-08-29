@@ -5,6 +5,9 @@ import io
 import database
 import google.generativeai as genai
 import json
+import numpy as np
+import cv2
+from ultralytics import YOLO
 
 app = Flask(__name__)
 CORS(app)
@@ -13,6 +16,16 @@ database.init_db()
 
 genai.configure(api_key="AIzaSyCm0ChcV1sN-TEUyGJ6i_hJ7y6jJ576msQ")
 gemini_model = genai.GenerativeModel('gemini-3.6-flash')
+yolo_model = YOLO("yolo11n.pt")
+
+SCRAP_PRICES = {
+    "bottle": {"item": "plastic bottle", "value": 15.0},
+    "cell phone": {"item": "electronic phone scrap", "value": 100.0},
+    "laptop": {"item": "electronic laptop scrap", "value": 500.0},
+    "book": {"item": "paper/notebook scrap", "value": 12.0},
+    "keyboard": {"item": "electronic keyboard scrap", "value": 50.0},
+    "mouse": {"item": "electronic mouse scrap", "value": 30.0},
+}
 
 MAP_TEMPLATE = """
 <!DOCTYPE html>
@@ -113,7 +126,7 @@ MAP_TEMPLATE = """
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"message": "CleanWatch AI Backend is running."})
+    return jsonify({"message": "CleanWatch Hybrid Backend is running."})
 
 @app.route("/map", methods=["GET"])
 def view_map():
@@ -149,51 +162,93 @@ def detect_waste():
 
     try:
         image_file = request.files["image"]
-        image = Image.open(io.BytesIO(image_file.read())).convert("RGB")
+        image_bytes = image_file.read()
         
         latitude = request.form.get("latitude")
         longitude = request.form.get("longitude")
         user_id = request.form.get("user_id", "guest_user")
 
-        prompt = """
-        Analyze this image carefully. Identify the main object being held, shown, or focused on in the foreground (such as paper, notebooks, books, electronics, plastics, metals, glass, fabric, or any other material). 
-        Determine its material type and estimate a reasonable scrap or recycling value in INR based on standard Indian rates. 
-        If an object is present in the foreground, you MUST classify it and give it a value—do not return zero items unless the image is completely blank or blurry.
-        Return ONLY a valid JSON object in this exact format, with no markdown formatting or extra text:
-        {
-            "items_found": [{"item": "paper notebook", "estimated_value": 10.0, "confidence": 0.95}],
-            "total_items": 1,
-            "total_value": 10.0
-        }
-        """
-
-        response = gemini_model.generate_content([prompt, image])
-        
-        response_text = response.text.strip().replace('```json', '').replace('```', '')
-        ai_data = json.loads(response_text)
-
         detected_items = []
         total_estimated_value = 0.0
+        success = False
 
-        for item in ai_data.get("items_found", []):
-            item_name = item.get("item", "")
-            if item_name.lower() != "not waste":
-                item_value = float(item.get("estimated_value", 0.0))
-                total_estimated_value += item_value
-                
-                detected_items.append({
-                    "item": item_name,
-                    "confidence": float(item.get("confidence", 0.99)),
-                    "estimated_value": item_value
-                })
+        # STEP 1: Try Gemini first
+        try:
+            image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            prompt = """
+            Analyze this image carefully. Identify the main object being held or shown in the foreground. 
+            Determine its material type and estimate a reasonable scrap value in INR based on standard Indian rates.
+            Return ONLY a valid JSON object in this exact format, with no markdown formatting or extra text:
+            {
+                "items_found": [{"item": "paper notebook", "estimated_value": 10.0, "confidence": 0.95}],
+                "total_items": 1,
+                "total_value": 10.0
+            }
+            """
+            response = gemini_model.generate_content([prompt, image_pil])
+            response_text = response.text.strip().replace('```json', '').replace('```', '')
+            ai_data = json.loads(response_text)
+            
+            for item in ai_data.get("items_found", []):
+                item_name = item.get("item", "")
+                if item_name.lower() != "not waste":
+                    item_value = float(item.get("estimated_value", 0.0))
+                    total_estimated_value += item_value
+                    detected_items.append({
+                        "item": item_name,
+                        "confidence": float(item.get("confidence", 0.99)),
+                        "estimated_value": item_value
+                    })
+            if detected_items:
+                success = True
+        except Exception as api_err:
+            print("Gemini limit hit, switching to local YOLO fallback:", api_err)
 
-                database.log_scan(
-                    user_id=user_id,
-                    item_type=item_name,
-                    estimated_value=item_value,
-                    lat=latitude,
-                    lon=longitude
-                )
+        # STEP 2: Fallback to YOLO11
+        if not success or not detected_items:
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            results = yolo_model(img)
+
+            for r in results:
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    class_name = yolo_model.names[cls_id]
+                    conf = float(box.conf[0])
+
+                    if class_name == "person":
+                        continue
+
+                    if conf > 0.3:
+                        mapped = SCRAP_PRICES.get(class_name, {"item": f"recyclable {class_name}", "value": 10.0})
+                        item_name = mapped["item"]
+                        item_value = mapped["value"]
+                        
+                        total_estimated_value += item_value
+                        detected_items.append({
+                            "item": item_name,
+                            "confidence": round(conf, 2),
+                            "estimated_value": item_value
+                        })
+
+        if not detected_items:
+            item_name = "general recyclable material"
+            item_value = 10.0
+            total_estimated_value = item_value
+            detected_items.append({
+                "item": item_name,
+                "confidence": 0.85,
+                "estimated_value": item_value
+            })
+
+        for item in detected_items:
+            database.log_scan(
+                user_id=user_id,
+                item_type=item["item"],
+                estimated_value=item["estimated_value"],
+                lat=latitude,
+                lon=longitude
+            )
 
         return jsonify({
             "status": "success",
@@ -202,8 +257,6 @@ def detect_waste():
             "detections": detected_items
         })
 
-    except json.JSONDecodeError:
-        return jsonify({"error": "AI response formatting error. Please try scanning again."}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
