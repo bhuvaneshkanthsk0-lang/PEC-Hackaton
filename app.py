@@ -39,22 +39,24 @@ SCRAP_PRICES = {
     "white-glass": 4.0
 }
 
-# 5. Web UI Template (Now with GPS Geolocation)
+# 5. Web UI Template (Detection + GPS)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EcoTrack AI - Waste Detector</title>
+    <title>CleanWatch AI - Waste Detector</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
         .card { background: #1e293b; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 100%; max-width: 480px; }
         h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #22c55e; }
         p { color: #94a3b8; font-size: 0.9rem; margin-bottom: 1.5rem; }
         input[type="file"] { width: 100%; padding: 0.5rem; margin-bottom: 1rem; background: #334155; border-radius: 6px; color: #f8fafc; border: 1px solid #475569; }
-        button { width: 100%; background: #22c55e; color: #0f172a; font-weight: bold; border: none; padding: 0.75rem; border-radius: 6px; cursor: pointer; font-size: 1rem; transition: background 0.2s; }
+        button { width: 100%; background: #22c55e; color: #0f172a; font-weight: bold; border: none; padding: 0.75rem; border-radius: 6px; cursor: pointer; font-size: 1rem; transition: background 0.2s; margin-bottom: 0.5rem; }
         button:hover { background: #16a34a; }
+        .map-btn { background: #38bdf8; }
+        .map-btn:hover { background: #0284c7; }
         #results { margin-top: 1.5rem; background: #0f172a; padding: 1rem; border-radius: 8px; border: 1px solid #334155; display: none; }
         pre { color: #38bdf8; font-size: 0.85rem; overflow-x: auto; margin: 0; }
         .highlight { color: #facc15; font-weight: bold; }
@@ -62,13 +64,14 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="card">
-        <h1>EcoTrack AI</h1>
+        <h1>CleanWatch AI</h1>
         <p>Upload or snap a waste photo to identify type, value, and location.</p>
         
         <form id="uploadForm">
             <input type="file" id="imageInput" name="image" accept="image/*" required>
             <button type="submit" id="submitBtn">Detect Waste</button>
         </form>
+        <button class="map-btn" onclick="window.location.href='/map'">View Live Map</button>
 
         <div id="results">
             <h3 style="margin-top:0; color:#f8fafc;">Detection Summary</h3>
@@ -102,24 +105,20 @@ HTML_TEMPLATE = """
             if ("geolocation" in navigator) {
                 navigator.geolocation.getCurrentPosition(
                     async (position) => {
-                        // User allowed location: append coordinates
                         formData.append('latitude', position.coords.latitude);
                         formData.append('longitude', position.coords.longitude);
                         await sendToBackend(formData);
                     },
                     async (error) => {
-                        // User denied location or it failed: proceed without GPS
                         console.warn("Location access denied or unavailable.");
                         await sendToBackend(formData);
                     }
                 );
             } else {
-                // Browser doesn't support geolocation
                 await sendToBackend(formData);
             }
         });
 
-        // Send the combined Image + GPS data to Flask
         async function sendToBackend(formData) {
             try {
                 const res = await fetch('/detect', {
@@ -129,9 +128,7 @@ HTML_TEMPLATE = """
                 
                 const data = await res.json();
                 
-                if (!res.ok) {
-                    throw new Error(data.error || 'Server error');
-                }
+                if (!res.ok) throw new Error(data.error || 'Server error');
                 
                 resultsDiv.style.display = 'block';
                 jsonOutput.innerText = JSON.stringify(data, null, 2);
@@ -153,9 +150,96 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# 6. Map UI Template (Leaflet.js)
+MAP_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CleanWatch - Authority Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; background: #0f172a; color: #f8fafc; }
+        header { padding: 1rem; background: #1e293b; text-align: center; font-size: 1.2rem; font-weight: bold; color: #22c55e; display: flex; justify-content: space-between; align-items: center; }
+        .back-btn { background: #334155; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; text-decoration: none; font-size: 0.9rem; }
+        .back-btn:hover { background: #475569; }
+        #map { height: calc(100vh - 60px); width: 100%; }
+        .leaflet-popup-content { color: #0f172a; font-size: 14px; }
+        .highlight { color: #16a34a; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <header>
+        <a href="/" class="back-btn">← Back to Scanner</a>
+        CleanWatch Live Waste Map
+        <div style="width: 80px;"></div> <!-- Spacer for centering -->
+    </header>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Initialize map centered on Chennai
+        const map = L.map('map').setView([13.0827, 80.2707], 12);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // Fetch data from Flask API
+        async function loadMarkers() {
+            try {
+                const response = await fetch('/api/map-data');
+                const data = await response.json();
+                
+                if (data.length === 0) {
+                    console.log("No waste reports found.");
+                    return;
+                }
+
+                // Add a marker for every waste report
+                data.forEach(report => {
+                    const popupText = `
+                        <b>Item:</b> ${report.item_type.toUpperCase()}<br>
+                        <b>Value:</b> <span class="highlight">₹${report.estimated_value}</span><br>
+                        <b>Time:</b> ${report.timestamp}
+                    `;
+                    L.marker([report.latitude, report.longitude])
+                        .addTo(map)
+                        .bindPopup(popupText);
+                });
+
+                // Re-center map to the latest report
+                const latest = data[data.length - 1];
+                map.setView([latest.latitude, latest.longitude], 15);
+
+            } catch (error) {
+                console.error("Error loading map data:", error);
+            }
+        }
+
+        loadMarkers();
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/", methods=["GET"])
 def home():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route("/map", methods=["GET"])
+def view_map():
+    return render_template_string(MAP_TEMPLATE)
+
+@app.route("/api/map-data", methods=["GET"])
+def get_map_data():
+    try:
+        data = database.get_all_reports()
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/detect", methods=["POST"])
 def detect_waste():
@@ -214,5 +298,4 @@ def detect_waste():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Debug and reloader disabled to prevent Windows multithreading deadlocks
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
